@@ -12,7 +12,7 @@ libhook = {git = "https://github.com/qwerty01/libhook"}
 
 # Usage
 
-TODO
+TODO, this library is a work in progress and is constantly changing.
 
 # Contributing
 

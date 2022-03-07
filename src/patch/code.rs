@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 use std::slice;
 
 use iced_x86::{
-    BlockEncoderOptions, BlockEncoderResult, Decoder, DecoderOptions, IcedError, Instruction,
-    InstructionBlock,
+    BlockEncoderOptions, BlockEncoderResult, Decoder, DecoderOptions, FlowControl, IcedError,
+    Instruction, InstructionBlock,
 };
 use thiserror::Error;
 
@@ -121,17 +121,28 @@ pub trait Architecture {
         Self::Error: From<region::Error>,
     {
         // Get the new length and disassembled instructions
-        let (instr, _new_size) = Self::trim_size(src, size);
+        let (mut instr, mut new_size) = Self::expand_size(src, size);
+
+        if let Some(i) = instr.last() {
+            if i.flow_control() != FlowControl::Return {
+                // TODO: How do we do a non-rip-relative branch?
+                //instr.push(Instruction::with_far_branch(code, selector, offset));
+                new_size += instr.last().unwrap().len();
+            }
+        }
+
+        // Create the executable buffer from the instruction buffer
+        // /!\ /!\ MAJOR HACK /!\ /!\
+        // There is no way to know what size we'll need before we encode the new instructions, but we need the size to make the buffer it'll be moved to
+        // It probably won't need more than twice the total size, so we'll just double the size and add 10 in case it's small
+        // TODO: is there *any* way to do this? The instruction sizes could change depending on the value of RIP, so we can't just make up a spot and then fix it later
+        let buffer = ExecutableBuffer::new_uninit(new_size * 2 + 10)?;
 
         // Create an instruction block for the destination
-        // TODO: how do I get the dest poitner?
-        let block = InstructionBlock::new(&instr, src as _);
+        let block = InstructionBlock::new(&instr, buffer.data as _);
 
         // Encode the instructions in the new location
         let block = Self::encode(block, BlockEncoderOptions::NONE)?;
-
-        // Create the executable buffer from the instruction buffer
-        let buffer = ExecutableBuffer::new(block.code_buffer)?;
 
         Ok(buffer)
     }

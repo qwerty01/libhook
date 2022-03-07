@@ -127,12 +127,15 @@ mod tests {
     #[test]
     /// Tests to ensure permissions are actually set
     fn test_perms() {
+        // Global immutables are stored in a read-only section in the binary.
+        // Normally, writing to this global would result in a segfault, but PermissionWrapper changes the permissions to be writable so that no fault occurs
         let data = b"1234";
 
         let ptr = data.as_ptr();
         let size = data.len();
 
         // sanity check
+        // make sure the data is what we expect and that the data is definitely read-only
         // Note: we can't do `b"1234"` because it might get compiled to the same global const that we're modifying
         assert_eq!(
             unsafe { slice::from_raw_parts(ptr, size) },

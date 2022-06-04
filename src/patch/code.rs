@@ -1,16 +1,17 @@
-//! This module contains a code patcher which can disassemble the target location and
+//! This module contains a code patcher which can disassemble the target location and patch enough bytes to jump back
 
 use std::marker::PhantomData;
-use std::slice;
+use std::{iter, ptr, slice};
 
 use iced_x86::{
-    BlockEncoderOptions, BlockEncoderResult, Decoder, DecoderOptions, FlowControl, IcedError,
-    Instruction, InstructionBlock,
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, IcedError, Instruction,
+    InstructionBlock,
 };
 use thiserror::Error;
 
-use crate::ExecutableBuffer;
+use crate::alloc::{allocate_executable, proximity::ProximityError, ExecutableMemory};
 
+use super::byte::BytePatcher;
 use super::mem::{PermissionError, PermissionWrapper};
 use super::Patcher;
 
@@ -26,6 +27,13 @@ pub enum CodeError<E> {
     /// Error while setting permissions of executable buffer
     #[error("{0}")]
     BufferError(#[from] region::Error),
+    /// Error allocating an executable buffer
+    #[error("{0}")]
+    ProximityError(#[from] ProximityError),
+    /// Buffer size that was allocated was too small.
+    /// If you encounter this error, open an issue and include the full patch bytes, [allocated] bytes from the original function, and the location of the target and location value from this error.
+    #[error("Buffer size was too small (allocated: {0}, needed: {1}, location: {2:?})")]
+    BufferTooSmall(usize, usize, *const ()),
 }
 
 /// Wrapper for patching code sections that may need to patch more bytes than what's provided
@@ -43,110 +51,41 @@ pub struct CodePatcher<P: Patcher, A: Architecture> {
     #[allow(unused)]
     patcher: PermissionWrapper<P>,
     /// Original data that was patched. Created such that `original` contains safely moved code that can be executed as if you were executing the original code.
-    original: ExecutableBuffer,
+    original: ExecutableMemory,
     /// Placeholder for architecture
     _arch: PhantomData<A>,
 }
+
 impl<P: Patcher, A: Architecture> CodePatcher<P, A> {
     /// Returns a pointer to the original function.
     ///
     /// This pointer is directly callable and will act as if you're calling the original unpatched function
     pub fn original(&self) -> *const u8 {
-        self.original.as_ptr()
+        self.original.as_ptr() as _
     }
 }
 
 /// Helper functions for an architecture
 pub trait Architecture {
-    /// Error type for the architecture
-    type Error;
-
-    /// Creates an instruction decoder from the given slice
-    fn decoder(data: &[u8], options: u32) -> Decoder;
-    /// Creates an encoder for the given instruction block
-    fn encode(block: InstructionBlock, options: u32) -> Result<BlockEncoderResult, Self::Error>;
     /// Gets the maximum instruction length for this architecture
     fn max_instr_len() -> usize;
-    /// Trims the provided size to the nearest instruction
-    ///
-    /// # Safety
-    ///
-    /// - `data` must be [https://doc.rust-lang.org/stable/std/ptr/index.html#safety](valid) for `size` + `max_instr_len() - 1` bytes
-    unsafe fn trim_size(data: *const u8, size: usize) -> (Vec<Instruction>, usize) {
-        // Add max_instr_len() - 1 in case we have the first byte of the longest instruction
-        let max_size = size + Self::max_instr_len() - 1;
-        let buf = slice::from_raw_parts(data, max_size);
-        let mut new_size = 0;
-        let decoder = Self::decoder(buf, DecoderOptions::NONE);
-        let inst: Vec<_> = decoder
-            .into_iter()
-            .take_while(|v| {
-                if new_size + v.len() >= size {
-                    false
-                } else {
-                    new_size += v.len();
-                    true
-                }
-            })
-            .collect();
-        (inst, new_size)
+    /// Gets the bitness of this architecture
+    fn bitness() -> u32;
+}
+
+/// x86_64 architecture
+pub struct X86_64;
+impl Architecture for X86_64 {
+    fn max_instr_len() -> usize {
+        16
     }
-    /// Expands the provded size to a full instruction
-    ///
-    /// # Safety
-    ///
-    /// - `data` must be [https://doc.rust-lang.org/stable/std/ptr/index.html#safety](valid) for `size` + `max_instr_len() - 1` bytes
-    unsafe fn expand_size(data: *const u8, size: usize) -> (Vec<Instruction>, usize) {
-        // Add max_instr_len() - 1 in case we have the first byte of the longest instruction
-        let max_size = size + Self::max_instr_len() - 1;
-        let buf = slice::from_raw_parts(data, max_size);
-        let mut new_size = 0;
-        let decoder = Self::decoder(buf, DecoderOptions::NONE);
-        let inst: Vec<_> = decoder
-            .into_iter()
-            .take_while(|v| {
-                new_size += v.len();
-                new_size + v.len() <= size
-            })
-            .collect();
-        (inst, new_size)
-    }
-    /// Copies a block of code from `src`, expanding to the nearest instruction
-    ///
-    /// # Safety
-    ///
-    /// - `src` must be [https://doc.rust-lang.org/stable/std/ptr/index.html#safety](valid) for `size` + `max_instr_len() - 1` bytes
-    unsafe fn copy_instr(src: *const u8, size: usize) -> Result<ExecutableBuffer, Self::Error>
-    where
-        Self::Error: From<region::Error>,
-    {
-        // Get the new length and disassembled instructions
-        let (mut instr, mut new_size) = Self::expand_size(src, size);
-
-        if let Some(i) = instr.last() {
-            if i.flow_control() != FlowControl::Return {
-                // TODO: How do we do a non-rip-relative branch?
-                //instr.push(Instruction::with_far_branch(code, selector, offset));
-                new_size += instr.last().unwrap().len();
-            }
-        }
-
-        // Create the executable buffer from the instruction buffer
-        // /!\ /!\ MAJOR HACK /!\ /!\
-        // There is no way to know what size we'll need before we encode the new instructions, but we need the size to make the buffer it'll be moved to
-        // It probably won't need more than twice the total size, so we'll just double the size and add 10 in case it's small
-        // TODO: is there *any* way to do this? The instruction sizes could change depending on the value of RIP, so we can't just make up a spot and then fix it later
-        let buffer = ExecutableBuffer::new_uninit(new_size * 2 + 10)?;
-
-        // Create an instruction block for the destination
-        let block = InstructionBlock::new(&instr, buffer.data as _);
-
-        // Encode the instructions in the new location
-        let block = Self::encode(block, BlockEncoderOptions::NONE)?;
-
-        Ok(buffer)
+    fn bitness() -> u32 {
+        64
     }
 }
+
+/// Patcher for patching x86_64 code
+pub type X64Patcher = CodePatcher<BytePatcher, X86_64>;
 
 impl<P, A> Patcher for CodePatcher<P, A>
 where
@@ -158,22 +97,74 @@ where
 
     unsafe fn patch(location: *mut u8, patch: &[u8]) -> Result<Self, Self::Error> {
         // TODO: use `BlockEncoder` to generate the actual patch
+
         // Length of patch + max instruction size
         let patch_size = patch.len();
-        let max_size = patch_size + 14;
+        let max_size = patch_size + A::max_instr_len();
+
+        // Actual patch data
         let data = slice::from_raw_parts(location, max_size);
-        let decoder = Decoder::with_ip(32, data, location as u64, DecoderOptions::NONE);
+
+        // Create a decoder to figure out what length we need to patch
+        let decoder = Decoder::with_ip(A::bitness(), data, location as u64, DecoderOptions::NONE);
+
+        // Get the full patch length. This might be larger than the passed in patch if the location being patched has more instructions than the patch, but never smaller.
         let mut size = 0usize;
-        let _instructions: Vec<_> = decoder
+        let mut instructions: Vec<_> = decoder
             .into_iter()
             .take_while(|v| {
+                let ret = size < patch_size; // include this instruction if it would go past the end
                 size += v.len();
-                size < patch_size
+                ret
             })
             .collect();
-        let size = size;
-        let patcher = PermissionWrapper::patch(location, &patch[..size])?;
-        let original = ExecutableBuffer::new_uninit(0)?;
+
+        // Now that we have the list of instructions, get the actual size
+        // Note: The old size will be 1 instruction too long, so we need to recalculate it here
+        let size = instructions.iter().fold(0, |c, i| c + i.len());
+
+        // Add a jmp to the previous location
+        instructions.push(Instruction::with_branch(
+            Code::Jmp_rel32_64,
+            // Jump to the end of the patched block
+            (location as usize + size) as u64,
+        )?);
+
+        // Allocate the place we'll be putting the old code
+        // Note: the original code may have some fixed up relative instructions, so we need to allocate a size larger than what we're moving in case the final code is larger
+        // doubling the size + max instruction length was chosen arbitrarilly (size * 2 isn't big enough for very small patches)
+        let mut original = allocate_executable(location as _, size * 2 + A::max_instr_len())?;
+
+        // Create a block for the new location
+        let block = InstructionBlock::new(&instructions, original.as_ptr() as _);
+
+        // This is where the magic happens. [`BlockEncoder`] re-encodes the instructions for the new location and fixes up all the relative instructions
+        // BlockEncoder requires a buffer be allocated *close* to where the original data came from, and our [`allocate_executable`] function handles that.
+        let encoded = BlockEncoder::encode(A::bitness(), block, BlockEncoderOptions::NONE)?;
+        let bytes = encoded.code_buffer;
+
+        // Sanity check in case our allocation is too small
+        if bytes.len() > original.len() {
+            // This is a bug. Check [CodeError::BufferTooSmall] for what info to include in your issue
+            return Err(CodeError::BufferTooSmall(
+                original.len(),
+                bytes.len(),
+                original.as_ptr() as _,
+            ));
+        }
+
+        // Finally, copy the fixed up buffer to its destination
+        ptr::copy(bytes.as_ptr(), original.as_mut_ptr(), bytes.len());
+
+        // We'll use a `PermissionWrapper` since the data is almost certainly pointing to Read/Execute memory with no write permissions
+        let patch: Vec<_> = patch
+            .iter()
+            .copied()
+            .chain(iter::repeat(b'\x90')) // Fill extra space with nops
+            .take(size)
+            .collect();
+        let patcher = PermissionWrapper::patch(location, &patch)?;
+
         Ok(Self {
             patcher,
             original,
@@ -183,5 +174,8 @@ where
 
     unsafe fn restore(self) {
         // Implemented in `drop`
+        // Note: the patcher is what actually restores the data
     }
 }
+
+// TODO: figure out how to test this

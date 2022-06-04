@@ -15,7 +15,6 @@ pub enum PermissionError<E> {
     #[error("{0}")]
     CustomError(E),
 }
-
 impl From<()> for PermissionError<()> {
     fn from(e: ()) -> Self {
         Self::CustomError(e)

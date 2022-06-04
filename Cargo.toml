@@ -10,5 +10,8 @@ edition = "2021"
 
 [dependencies]
 iced-x86 = "1.17.0"
+lazy_static = "1.4.0"
+mmap = { package = "mmap-fixed", version = "0.1.5" }
 region = "3.0.0"
+slice-pool = "0.4.1"
 thiserror = "1.0.30"

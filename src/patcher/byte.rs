@@ -2,41 +2,64 @@
 
 use std::ptr;
 
-use super::Patcher;
+use super::{PatchGuard, Patcher};
 
 /// Patcher for patching memory locations with byte arrays.
 /// This patcher never fails.
-pub struct BytePatcher {
+#[derive(Default)]
+pub struct BytePatcher;
+impl BytePatcher {
+    /// Creates a new [`BytePatcher`]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+unsafe impl Patcher for BytePatcher {
+    type Error = ();
+    type Guard<'a> = BytePatchGuard;
+
+    unsafe fn patch<'a>(
+        &'a self,
+        location: *mut u8,
+        patch: &[u8],
+    ) -> Result<Self::Guard<'a>, Self::Error> {
+        Ok(BytePatchGuard::patch(location, patch))
+    }
+}
+/// Guard for byte-patches
+///
+/// See [`BytePatcher`].
+pub struct BytePatchGuard {
     /// Original data from `location`
     original: Vec<u8>,
     /// Location of the patch
     location: *mut u8,
 }
-
-impl Patcher for BytePatcher {
-    type Error = ();
-
-    unsafe fn patch(location: *mut u8, patch: &[u8]) -> Result<Self, Self::Error> {
+impl BytePatchGuard {
+    /// Patches a location, returning a guard for unpatching
+    ///
+    /// # Safety
+    ///
+    /// `location` must be a valid pointer
+    unsafe fn patch(location: *mut u8, patch: &[u8]) -> Self {
         let mut original = Vec::with_capacity(patch.len());
+
         // Safety: caller must pass in a `location` pointer that is valid for the full length of the patch
         ptr::copy(location, original.as_mut_ptr(), patch.len());
 
         // Safety: We initialized the vec to patch.len(), so fix the length
         original.set_len(patch.len());
 
-        let patcher = Self { original, location };
+        let guard = Self { original, location };
 
         // Safety: caller must ensure that `location` is writable
         ptr::copy(patch.as_ptr(), location, patch.len());
 
-        Ok(patcher)
-    }
-
-    unsafe fn restore(self) {
-        // implemented in `drop`
+        guard
     }
 }
-impl Drop for BytePatcher {
+unsafe impl PatchGuard for BytePatchGuard {}
+impl Drop for BytePatchGuard {
     fn drop(&mut self) {
         // Safety: creator must pass in a `location` pointer that is valid and writable for the full length of the patch
         unsafe {
@@ -49,8 +72,8 @@ impl Drop for BytePatcher {
 mod tests {
     use std::slice;
 
-    use crate::patch::byte::BytePatcher;
-    use crate::patch::Patcher;
+    use crate::patcher::byte::BytePatcher;
+    use crate::patcher::{PatchGuard, Patcher};
 
     #[test]
     /// Test patch and revert functionality
@@ -61,14 +84,17 @@ mod tests {
         // sanity check
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [1, 2, 3, 4]);
 
+        // get our patcher to test
+        let patcher = BytePatcher::new();
+
         // patch the vec's data
-        let patch = unsafe { BytePatcher::patch(ptr, &[4, 3, 2, 1]).unwrap() };
+        let patch = unsafe { patcher.patch(ptr, &[4, 3, 2, 1]).unwrap() };
 
         // make sure the data was actually changed
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [4, 3, 2, 1]);
 
         // restore the patch
-        unsafe { patch.restore() };
+        patch.restore();
 
         // make sure the patch was restored
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [1, 2, 3, 4]);
@@ -86,14 +112,17 @@ mod tests {
         // sanity check
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [1, 2, 3, 4]);
 
+        // get our patcher to test
+        let patcher = BytePatcher::new();
+
         // patch the vec's data
-        let patch = unsafe { BytePatcher::patch((ptr as usize + 1) as _, &[5, 5]).unwrap() };
+        let patch = unsafe { patcher.patch((ptr as usize + 1) as _, &[5, 5]).unwrap() };
 
         // make sure the data was actually changed
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [1, 5, 5, 4]);
 
         // restore the patch
-        unsafe { patch.restore() };
+        patch.restore();
 
         // make sure the patch was restored
         assert_eq!(unsafe { slice::from_raw_parts(ptr, size) }, [1, 2, 3, 4]);

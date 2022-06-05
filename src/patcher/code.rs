@@ -12,8 +12,8 @@ use thiserror::Error;
 use crate::alloc::{allocate_executable, proximity::ProximityError, ExecutableMemory};
 
 use super::byte::BytePatcher;
-use super::mem::{PermissionError, PermissionWrapper};
-use super::Patcher;
+use super::mem::{PermissionError, PermissionWrapper, PermissionWrapperGuard};
+use super::{PatchGuard, Patcher};
 
 #[derive(Debug, Error)]
 /// Error types for `CodePatcher`
@@ -50,13 +50,38 @@ pub struct CodePatcher<P: Patcher, A: Architecture> {
     /// Internal patcher that will actually write the data we create
     #[allow(unused)]
     patcher: PermissionWrapper<P>,
-    /// Original data that was patched. Created such that `original` contains safely moved code that can be executed as if you were executing the original code.
-    original: ExecutableMemory,
     /// Placeholder for architecture
     _arch: PhantomData<A>,
 }
 
 impl<P: Patcher, A: Architecture> CodePatcher<P, A> {
+    /// Creates a new CodePatcher
+    ///
+    /// Note: The patcher will be wrapped in a [`PermissionGuard`], so there is no need to wrap it yourself
+    pub fn new(patcher: P) -> Self {
+        let patcher = PermissionWrapper::new(patcher);
+        Self {
+            patcher,
+            _arch: Default::default(),
+        }
+    }
+}
+
+/// Guard for patching code memory
+///
+/// See [`CodePatcher`].
+pub struct CodeGuard<G: PatchGuard> {
+    #[allow(dead_code)]
+    /// Underlying patch guard
+    guard: G,
+    /// Original data that was patched. Created such that `original` contains safely moved code that can be executed as if you were executing the original code.
+    original: ExecutableMemory,
+}
+impl<G: PatchGuard> CodeGuard<G> {
+    /// Wraps a patch guard.
+    fn guard(guard: G, original: ExecutableMemory) -> Self {
+        Self { guard, original }
+    }
     /// Returns a pointer to the original function.
     ///
     /// This pointer is directly callable and will act as if you're calling the original unpatched function
@@ -64,6 +89,7 @@ impl<P: Patcher, A: Architecture> CodePatcher<P, A> {
         self.original.as_ptr() as _
     }
 }
+unsafe impl<G: PatchGuard> PatchGuard for CodeGuard<G> {}
 
 /// Helper functions for an architecture
 pub trait Architecture {
@@ -87,15 +113,20 @@ impl Architecture for X86_64 {
 /// Patcher for patching x86_64 code
 pub type X64Patcher = CodePatcher<BytePatcher, X86_64>;
 
-impl<P, A> Patcher for CodePatcher<P, A>
+unsafe impl<P, A> Patcher for CodePatcher<P, A>
 where
     P: Patcher,
     A: Architecture,
     PermissionError<P::Error>: From<P::Error>,
 {
     type Error = CodeError<P::Error>;
+    type Guard<'a> = CodeGuard<PermissionWrapperGuard<P::Guard<'a>>> where Self: 'a;
 
-    unsafe fn patch(location: *mut u8, patch: &[u8]) -> Result<Self, Self::Error> {
+    unsafe fn patch<'a>(
+        &'a self,
+        location: *mut u8,
+        patch: &[u8],
+    ) -> Result<Self::Guard<'a>, Self::Error> {
         // TODO: use `BlockEncoder` to generate the actual patch
 
         // Length of patch + max instruction size
@@ -103,6 +134,7 @@ where
         let max_size = patch_size + A::max_instr_len();
 
         // Actual patch data
+        // Safety: the caller is required to ensure that `location` is valid
         let data = slice::from_raw_parts(location, max_size);
 
         // Create a decoder to figure out what length we need to patch
@@ -132,7 +164,7 @@ where
 
         // Allocate the place we'll be putting the old code
         // Note: the original code may have some fixed up relative instructions, so we need to allocate a size larger than what we're moving in case the final code is larger
-        // doubling the size + max instruction length was chosen arbitrarilly (size * 2 isn't big enough for very small patches)
+        // doubling the size + max instruction length was chosen arbitrarilly (size * 2 isn't big enough for very small patches since we add an extra jmp)
         let mut original = allocate_executable(location as _, size * 2 + A::max_instr_len())?;
 
         // Create a block for the new location
@@ -163,18 +195,9 @@ where
             .chain(iter::repeat(b'\x90')) // Fill extra space with nops
             .take(size)
             .collect();
-        let patcher = PermissionWrapper::patch(location, &patch)?;
+        let guard = self.patcher.patch(location, &patch)?;
 
-        Ok(Self {
-            patcher,
-            original,
-            _arch: Default::default(),
-        })
-    }
-
-    unsafe fn restore(self) {
-        // Implemented in `drop`
-        // Note: the patcher is what actually restores the data
+        Ok(CodeGuard::guard(guard, original))
     }
 }
 

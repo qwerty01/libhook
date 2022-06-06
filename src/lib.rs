@@ -9,3 +9,4 @@ pub mod alloc;
 pub mod code;
 pub mod hook;
 pub mod patcher;
+pub mod wrapper;

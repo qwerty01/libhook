@@ -1,4 +1,9 @@
 //! This module contains a code patcher which can disassemble the target location and patch enough bytes to jump back
+//!
+//! Note that [`CodePatcher`] does *not* implement [`Patcher`].
+//! This is because future pipelines may need to get the pointer to the original function *without* patching the location
+//!
+//! When you finally want to patch, use [`CodePatcher::patch`].
 
 use std::marker::PhantomData;
 use std::{iter, ptr, slice};
@@ -12,8 +17,8 @@ use thiserror::Error;
 use crate::alloc::{allocate_executable, proximity::ProximityError, ExecutableMemory};
 
 use super::byte::BytePatcher;
-use super::mem::{PermissionError, PermissionWrapper, PermissionWrapperGuard};
-use super::{PatchGuard, Patcher};
+use super::mem::{to_mut, PermissionError, PermissionWrapper};
+use super::Patcher;
 
 #[derive(Debug, Error)]
 /// Error types for `CodePatcher`
@@ -48,86 +53,37 @@ pub enum CodeError<E> {
 /// we can still disassemble the full instruction)
 pub struct CodePatcher<P: Patcher, A: Architecture> {
     /// Internal patcher that will actually write the data we create
-    #[allow(unused)]
     patcher: PermissionWrapper<P>,
+    /// Original data that was patched. Created such that `original` contains safely moved code that can be executed as if you were executing the original code.
+    original: ExecutableMemory,
+    /// Data to patch to the location
+    patch: Vec<u8>,
+    /// location to patch
+    location: *const u8,
     /// Placeholder for architecture
     _arch: PhantomData<A>,
 }
 
-impl<P: Patcher, A: Architecture> CodePatcher<P, A> {
-    /// Creates a new CodePatcher
-    ///
-    /// Note: The patcher will be wrapped in a [`PermissionGuard`], so there is no need to wrap it yourself
-    pub fn new(patcher: P) -> Self {
-        let patcher = PermissionWrapper::new(patcher);
-        Self {
-            patcher,
-            _arch: Default::default(),
-        }
-    }
-}
-
-/// Guard for patching code memory
-///
-/// See [`CodePatcher`].
-pub struct CodeGuard<G: PatchGuard> {
-    #[allow(dead_code)]
-    /// Underlying patch guard
-    guard: G,
-    /// Original data that was patched. Created such that `original` contains safely moved code that can be executed as if you were executing the original code.
-    original: ExecutableMemory,
-}
-impl<G: PatchGuard> CodeGuard<G> {
-    /// Wraps a patch guard.
-    fn guard(guard: G, original: ExecutableMemory) -> Self {
-        Self { guard, original }
-    }
-    /// Returns a pointer to the original function.
-    ///
-    /// This pointer is directly callable and will act as if you're calling the original unpatched function
-    pub fn original(&self) -> *const u8 {
-        self.original.as_ptr() as _
-    }
-}
-unsafe impl<G: PatchGuard> PatchGuard for CodeGuard<G> {}
-
-/// Helper functions for an architecture
-pub trait Architecture {
-    /// Gets the maximum instruction length for this architecture
-    fn max_instr_len() -> usize;
-    /// Gets the bitness of this architecture
-    fn bitness() -> u32;
-}
-
-/// x86_64 architecture
-pub struct X86_64;
-impl Architecture for X86_64 {
-    fn max_instr_len() -> usize {
-        16
-    }
-    fn bitness() -> u32 {
-        64
-    }
-}
-
-/// Patcher for patching x86_64 code
-pub type X64Patcher = CodePatcher<BytePatcher, X86_64>;
-
-unsafe impl<P, A> Patcher for CodePatcher<P, A>
+impl<P, A> CodePatcher<P, A>
 where
     P: Patcher,
     A: Architecture,
     PermissionError<P::Error>: From<P::Error>,
 {
-    type Error = CodeError<P::Error>;
-    type Guard<'a> = CodeGuard<PermissionWrapperGuard<P::Guard<'a>>> where Self: 'a;
-
-    unsafe fn patch<'a>(
-        &'a self,
-        location: *mut u8,
-        patch: &[u8],
-    ) -> Result<Self::Guard<'a>, Self::Error> {
-        // TODO: use `BlockEncoder` to generate the actual patch
+    /// Creates a new CodePatcher
+    ///
+    /// Note: The patcher will be wrapped in a [`PermissionWrapper`], so there is no need to wrap it yourself
+    ///
+    /// # Safety
+    ///
+    /// `location` must point to valid executable code, valid for the length of `patch` + the max architecture
+    pub unsafe fn new<B: AsRef<[u8]>>(
+        patcher: P,
+        location: *const u8,
+        patch: B,
+    ) -> Result<Self, CodeError<P::Error>> {
+        let patch = patch.as_ref();
+        let patcher = PermissionWrapper::new(patcher);
 
         // Length of patch + max instruction size
         let patch_size = patch.len();
@@ -188,17 +144,60 @@ where
         // Finally, copy the fixed up buffer to its destination
         ptr::copy(bytes.as_ptr(), original.as_mut_ptr(), bytes.len());
 
-        // We'll use a `PermissionWrapper` since the data is almost certainly pointing to Read/Execute memory with no write permissions
-        let patch: Vec<_> = patch
+        // Re-generate the patch, filling the rest of the space with NOPs
+        let patch = patch
             .iter()
             .copied()
             .chain(iter::repeat(b'\x90')) // Fill extra space with nops
             .take(size)
             .collect();
-        let guard = self.patcher.patch(location, &patch)?;
 
-        Ok(CodeGuard::guard(guard, original))
+        Ok(Self {
+            patcher,
+            original,
+            patch,
+            location,
+            _arch: Default::default(),
+        })
+    }
+    /// Returns a pointer to the original function.
+    ///
+    /// This pointer is directly callable regardless of patch status and will act as if you're calling the original unpatched function
+    pub fn original(&self) -> *const u8 {
+        self.original.as_ptr()
+    }
+    /// Patches the original location, returning a guard for the patch
+    pub fn patch(
+        &self,
+    ) -> Result<
+        <PermissionWrapper<P> as Patcher>::Guard<'_>,
+        <PermissionWrapper<P> as Patcher>::Error,
+    > {
+        // Safety: `self.location` is validated in [`CodePatcher::new`]
+        unsafe { self.patcher.patch(to_mut(self.location), &self.patch) }
     }
 }
+
+/// Helper functions for an architecture
+pub trait Architecture {
+    /// Gets the maximum instruction length for this architecture
+    fn max_instr_len() -> usize;
+    /// Gets the bitness of this architecture
+    fn bitness() -> u32;
+}
+
+/// x86_64 architecture
+pub struct X86_64;
+impl Architecture for X86_64 {
+    fn max_instr_len() -> usize {
+        16
+    }
+    fn bitness() -> u32 {
+        64
+    }
+}
+
+/// Patcher for patching x86_64 code
+pub type X64Patcher = CodePatcher<BytePatcher, X86_64>;
 
 // TODO: figure out how to test this
